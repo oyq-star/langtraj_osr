@@ -1,0 +1,45 @@
+# LangTraj-OSR Default Configuration
+model:
+  d_model: 256
+  nhead: 4
+  num_layers: 4
+  dropout: 0.1
+  max_len: 64
+  poi_vocab_size: 64
+  time_bins: 168
+  dwell_bins: 16
+  transition_types: 4
+  n_prototypes: 8
+  n_primitives: 10
+  # HuggingFace model name or local path (for offline use: "models_cache/all-MiniLM-L6-v2")
+  text_encoder: "sentence-transformers/all-MiniLM-L6-v2"
+  lambda_prim: 0.5
+  gamma_loc: 0.25
+
+training:
+  batch_size: 256
+  lr_backbone: 1.0e-4
+  lr_heads: 5.0e-4
+  weight_decay: 1.0e-2
+  epochs: 50
+  temperature: 0.07
+  scheduler: cosine
+  warmup_epochs: 5
+
+  loss_weights:
+    pair: 1.0
+    cls: 0.5
+    prim: 1.0
+    para: 0.2
+    orth: 0.05
+    norm: 1.0
+
+data:
+  max_history_trips: 50
+  min_history_trips: 5
+
+evaluation:
+  conformal_alpha_norm: 0.05
+  conformal_alpha_concept: 0.10
+
+seeds: [42, 123, 456]
