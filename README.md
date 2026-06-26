@@ -81,11 +81,6 @@ code/
 │   │   └── geolife.py                  # Data loader
 │   ├── foursquare_tokyo/               # Tokyo check-in data
 │   └── foursquare_nyc/                 # NYC check-in data
-├── results/                             # All experiment results (see below)
-├── run_all_experiments.sh               # One-click experiment orchestrator
-├── setup.py                             # Package installation
-├── requirements.txt                     # Python dependencies
-└── README.md                            # This file
 ```
 
 ---
@@ -366,60 +361,7 @@ time_shift, role_swap, destination_sub, detour, missing_stop, dwell_inflate, ord
 
 ---
 
-## Results Directory Guide
 
-All experiment outputs are in `results/`:
-
-```
-results/
-├── main/                        # Final main results (v6)
-│   ├── synthetic_seed{42,123,456}.json
-│   ├── porto_seed{42,123,456}.json
-│   ├── tokyo_seed{42,123,456}.json
-│   └── nyc_seed{42,123,456}.json
-├── baselines_synthetic/         # 8 synthetic baselines + retrieval
-│   ├── {norm_only,dsl_xl,...}_s42.json
-│   ├── dsl_xl_s{123,456}.json
-│   └── retrieval_baselines.json
-├── baselines_porto/             # Porto baselines (multi-seed)
-│   ├── summary_seed{42,123,456}.json
-│   ├── {norm_only,dsl_xl,lm_tad}_s{42,123,456}.json
-│   └── {nl2dsl,canonical_json,atrom_ossl}_s42.json
-├── baselines_foursquare/        # DSL-XL on Tokyo/NYC
-│   ├── dsl_xl_tokyo_s42.json
-│   └── dsl_xl_nyc_s42.json
-├── ablation/                    # 8-variant ablation study
-│   ├── ablation_typed_v2_results.json   # Aggregated
-│   ├── {no_repel,no_cls,...}_s42.json   # Per-variant
-│   ├── shuffled_s42.json                # Language-disabled control
-│   └── random_bank_s42.json             # Random concept bank
-├── typed_metrics/               # Typed evaluation details
-│   ├── multiseed_typed_results.json
-│   ├── multiseed_foursquare_results.json
-│   ├── synth_prim_fix_typed.json
-│   ├── porto_prim_fix_typed.json
-│   └── nyc_stratified_s42.json
-├── primitive_oracle/            # Circularity check
-│   └── primitive_oracle_results.json
-├── robustness/                  # Robustness experiments
-│   ├── robustness_results.json
-│   └── bank_scaling_results.json
-├── cross_city/                  # Cross-city transfer
-│   ├── nyc2tokyo_s42.json
-│   └── tokyo2nyc_s42.json
-├── case_study/                  # Qualitative analysis
-│   └── porto_case_study.json
-├── truezs/                      # True zero-shot protocol (v7)
-│   ├── synthetic_seed{42,123,456}.json
-│   └── porto_seed{42,123,456}.json
-├── diagnostic_plots/            # Visualization figures (PDF + PNG)
-│   ├── confusion_matrix_{synthetic,porto}.{pdf,png}
-│   ├── error_rejection_{synthetic,porto}.{pdf,png}
-│   └── zs_scores_{synthetic,porto}.{pdf,png}
-└── older_versions/v5/           # Earlier experiment versions
-```
-
----
 
 ## Offline Server Usage
 
@@ -443,18 +385,6 @@ python -m langtraj_osr.train --use_synthetic --seed 42 \
 
 ---
 
-## Citation
-
-```bibtex
-@inproceedings{langtraj2026kdd,
-  title={LangTraj-OSR: Language-Guided Open-Set Anomaly Detection
-         and Concept Assignment in Semantic Trajectories},
-  author={Anonymous},
-  booktitle={Proceedings of the 32nd ACM SIGKDD Conference on
-             Knowledge Discovery and Data Mining},
-  year={2026}
-}
-```
 
 ## License
 
