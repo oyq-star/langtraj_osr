@@ -2,7 +2,7 @@
 
 **Language-Guided Open-Set Anomaly Detection and Concept Assignment in Semantic Trajectories**
 
-Code and experiment results for the KDD 2026 submission. LangTraj-OSR enables analysts to define anomaly concepts in natural language and assigns each flagged trajectory to the matching definition, with calibrated rejection of unknown anomaly types.
+Data is used in this project can be downloaded from [Google Drive] (https://drive.google.com/file/d/16q92I-hh4y2L4gb5reFuRkKoNYYvnoeX/view?usp=drive_link)
 
 ---
 
