@@ -337,54 +337,6 @@ time_shift, role_swap, destination_sub, detour, missing_stop, dwell_inflate, ord
 | Calibration | ECE, Brier score, NLL, conformal coverage |
 | Per-split | All above computed per split (seen, zs-comp, zs-fam, unknown) |
 
----
-
-## Main Results (3-seed mean)
-
-### Binary Detection (AUROC)
-
-| Dataset | Overall | A_seen | A_zs-comp | A_zs-fam | A_unknown |
-|---------|---------|--------|-----------|----------|-----------|
-| Synthetic | 0.995 | 0.998 | 0.988 | 0.999 | 0.993 |
-| Porto | 0.995 | 0.998 | 0.988 | 0.999 | 0.993 |
-| Tokyo | 0.977 +/- 0.031 | - | - | - | - |
-| NYC | 0.883 +/- 0.174 | - | - | - | - |
-
-### Typed Concept Assignment (Seen Concepts)
-
-| Dataset | Top-1 Acc | Macro-F1 |
-|---------|-----------|----------|
-| Synthetic | 0.947 +/- 0.006 | 0.947 +/- 0.006 |
-| Porto | 0.655 +/- 0.008 | 0.655 +/- 0.008 |
-| Tokyo | 0.931 +/- 0.089 | - |
-| NYC | 0.781 +/- 0.267 | - |
-
----
-
-
-
-## Offline Server Usage
-
-For GPU servers without internet access:
-
-```bash
-# 1. On a machine with internet, download models
-python scripts/download_for_offline.py --output models_cache/
-
-# 2. Copy models_cache/ to the server
-
-# 3. On the server, set environment variables
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-
-# 4. Train with local model path
-python -m langtraj_osr.train --use_synthetic --seed 42 \
-    --text_encoder models_cache/all-MiniLM-L6-v2 \
-    --output_dir results/synthetic/seed_42
-```
-
----
-
 
 ## License
 
