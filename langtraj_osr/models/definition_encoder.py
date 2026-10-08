@@ -53,6 +53,7 @@ class DefinitionEncoder(nn.Module):
         # access; the encoder is loaded on first forward call.
         self._text_encoder: object | None = None
         self._text_dim: int | None = None
+        self._text_cache: dict[str, torch.Tensor] = {}
 
         # Placeholders — actual layers created in _ensure_encoder()
         self.projection: nn.Module | None = None
@@ -109,10 +110,16 @@ class DefinitionEncoder(nn.Module):
         model device as a float tensor."""
         self._ensure_encoder()
         device = next(self.projection.parameters()).device  # type: ignore[union-attr]
-        embeddings = self._text_encoder.encode(  # type: ignore[union-attr]
-            texts, convert_to_tensor=True, show_progress_bar=False
-        )
-        return embeddings.to(device).float()
+        # Frozen, deterministic sentence vectors are reused across batches.
+        # Projection heads remain outside the cache and retain their gradients.
+        missing = list(dict.fromkeys(t for t in texts if t not in self._text_cache))
+        if missing:
+            embeddings = self._text_encoder.encode(  # type: ignore[union-attr]
+                missing, convert_to_tensor=True, show_progress_bar=False
+            )
+            for text, embedding in zip(missing, embeddings):
+                self._text_cache[text] = embedding.detach().cpu().float()
+        return torch.stack([self._text_cache[t] for t in texts]).to(device)
 
     # ------------------------------------------------------------------
     def forward(

@@ -1,7 +1,8 @@
 """Conformal calibration for LangTraj-OSR.
 
-Provides distribution-free coverage guarantees for both the normality gate
-(Stage A) and the concept classification (Stage B).
+Provides split-conformal calibration for Stage A and seen Stage-B concepts.
+Transferred thresholds for zero-shot concepts are empirical heuristics and do
+not inherit a formal conformal guarantee.
 """
 
 from __future__ import annotations
@@ -73,10 +74,11 @@ class ConformalCalibrator:
 
         sorted_energies = np.sort(normal_energies)
         # Quantile index with finite-sample correction
-        idx = int(np.ceil((1 - alpha) * (n + 1))) - 1
-        idx = min(max(idx, 0), n - 1)
-
-        self.q_norm = float(sorted_energies[idx])
+        rank = int(np.ceil((1 - alpha) * (n + 1)))
+        # The augmented empirical distribution includes +infinity.  Returning
+        # infinity is the exact finite-sample rule when the requested rank is
+        # n+1 (e.g., very small calibration sets at alpha=0.05).
+        self.q_norm = float('inf') if rank > n else float(sorted_energies[max(rank - 1, 0)])
         return self.q_norm
 
     # ------------------------------------------------------------------

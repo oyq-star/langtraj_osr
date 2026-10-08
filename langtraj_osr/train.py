@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
 from .core.concepts import get_all_definitions, get_concept_ids_for_split
-from .core.dataset import MobDefBenchDataModule, collate_mobdef
+from .core.dataset import MobDefBenchDataModule, MobDefBenchDataset, collate_mobdef
 from .core.utils import (
     AverageMeter,
     EarlyStopping,
@@ -176,7 +177,10 @@ def fit_user_routines(model: LangTrajOSR, train_loader: DataLoader,
     user_prototypes: Dict[str, Dict[str, torch.Tensor]] = {}
     for uid, embs in user_embeddings.items():
         emb_stack = torch.stack(embs)
-        user_prototypes[uid] = model.user_history.fit_user(emb_stack.to(device))
+        user_prototypes[uid] = model.user_history.fit_user(
+            emb_stack.to(device),
+            n_prototypes=model.user_history.n_prototypes,
+        )
 
     logger.info("  Fitted routines for %d users", len(user_prototypes))
     return user_prototypes
@@ -226,7 +230,7 @@ def train_one_epoch(
         proto_batch = _batch_user_prototypes(user_ids, user_prototypes, device)
 
         with autocast(enabled=scaler.is_enabled()):
-            outputs = model(episodes, ~pad_mask, proto_batch, definition_texts)
+            outputs = model(episodes, pad_mask, proto_batch, definition_texts)
 
             # Separate normal and anomalous energies
             normal_idx = (labels == 0)
@@ -345,10 +349,13 @@ def train_one_epoch(
                         torch.isfinite(losses["total"]).item())
         # Safety: skip batch if loss is NaN/Inf to prevent weight corruption
         if not torch.isfinite(losses["total"]):
-            optimizer.zero_grad()
+            model.zero_grad(set_to_none=True)
             continue
 
-        optimizer.zero_grad()
+        # Lazy text projection parameters are outside this optimizer. Clear
+        # their gradients too, so stale scaled gradients cannot poison later
+        # finite-gradient checks or accumulate indefinitely.
+        model.zero_grad(set_to_none=True)
         scaler.scale(losses["total"]).backward()
         scaler.unscale_(optimizer)
 
@@ -360,7 +367,7 @@ def train_one_epoch(
             for p in model.parameters() if p.grad is not None
         )
         if not grad_ok:
-            optimizer.zero_grad()
+            model.zero_grad(set_to_none=True)
             scaler.update()  # reduce scale to prevent future overflow
             continue
 
@@ -372,6 +379,8 @@ def train_one_epoch(
             if key in losses:
                 meters[key].update(losses[key].item() if isinstance(losses[key], torch.Tensor) else losses[key], B)
 
+    if meters['total'].count == 0:
+        raise RuntimeError('No optimizer update succeeded in this epoch; refusing to report zero training loss.')
     return {k: v.avg for k, v in meters.items()}
 
 
@@ -398,7 +407,7 @@ def validate(
         episodes = _tensor_to_episode_dict(ep_tensor)
         proto_batch = _batch_user_prototypes(user_ids, user_prototypes, device)
 
-        outputs = model(episodes, ~pad_mask, proto_batch, definition_texts_bank)
+        outputs = model(episodes, pad_mask, proto_batch, definition_texts_bank)
         all_scores.append(outputs["concept_scores"].cpu())
         all_labels.append(labels)
         all_energies.append(outputs["E_norm"].cpu())
@@ -440,6 +449,218 @@ def validate(
     return metrics
 
 
+@torch.no_grad()
+def collect_normal_energies(
+    model: LangTrajOSR,
+    loader: DataLoader,
+    device: torch.device,
+    user_prototypes: Dict[str, Dict[str, torch.Tensor]],
+    definition_texts_bank: List[str],
+) -> np.ndarray:
+    """Collect Stage-A energies for normal samples only.
+
+    This helper is intentionally applied to the untouched test split after
+    training and checkpoint selection have finished.  It therefore cannot
+    affect routine-bank fitting, early stopping, or model selection.
+    """
+    model.eval()
+    normal_energies: List[torch.Tensor] = []
+    for batch in loader:
+        labels = batch["label"]
+        normal_idx = labels == 0
+        if not normal_idx.any():
+            continue
+        ep_tensor = batch["episode_tensor"].to(device)
+        pad_mask = batch["mask"].to(device)
+        user_ids = batch["user_id"]
+        episodes = _tensor_to_episode_dict(ep_tensor)
+        proto_batch = _batch_user_prototypes(user_ids, user_prototypes, device)
+        outputs = model(episodes, pad_mask, proto_batch, definition_texts_bank)
+        normal_energies.append(outputs["E_norm"][normal_idx].detach().cpu())
+
+    if not normal_energies:
+        raise RuntimeError("No normal samples were found in the held-out test split.")
+    return torch.cat(normal_energies).float().numpy()
+
+
+def _wilson_interval(successes: int, trials: int, z: float = 1.959963984540054) -> Tuple[float, float]:
+    """Return the two-sided 95% Wilson score interval for a binomial rate."""
+    if trials <= 0:
+        raise ValueError("Wilson interval requires a positive number of trials.")
+    p_hat = successes / trials
+    z2 = z * z
+    denom = 1.0 + z2 / trials
+    center = (p_hat + z2 / (2.0 * trials)) / denom
+    radius = z * np.sqrt((p_hat * (1.0 - p_hat) / trials) + z2 / (4.0 * trials * trials)) / denom
+    return max(0.0, center - radius), min(1.0, center + radius)
+
+
+def run_coverage_supplement(model, data_module, device, def_bank, args, output_dir):
+    """Freeze the selected model; reserve separate user history and score pools.
+
+    The benchmark splits users, so its held-out users have no training bank.
+    Reserve 40% of each eligible user's normal trips for a frozen routine bank
+    (at least one support trip while retaining at least one scoring trip)
+    before splitting the remaining trips for independent calibration/testing.
+    Selection depends only on a prespecified seed and sample identities.
+    """
+    normal_test = [t for t in data_module.trajectories['test'] if t.label == 0]
+    key = lambda t: (str(t.user_id), str(t.trip_id))
+    source_sets = {s: {key(t) for t in data_module.trajectories[s]} for s in ['train', 'val']}
+    test_keys = [key(t) for t in normal_test]
+    if len(set(test_keys)) != len(test_keys):
+        raise ValueError('Duplicate normal trajectory identities in held-out pool')
+    for s, keys in source_sets.items():
+        if set(test_keys) & keys:
+            raise ValueError(f'Held-out normal trajectories overlap {s}')
+    by_user = {}
+    for t in normal_test:
+        by_user.setdefault(str(t.user_id), []).append(t)
+    rng = np.random.default_rng(args.seed + 700001)
+    support, pool, excluded = [], [], []
+    for uid in sorted(by_user):
+        trips = sorted(by_user[uid], key=key)
+        if len(trips) < 2:
+            excluded.extend(trips)
+            continue
+        order = rng.permutation(len(trips))
+        n_support = min(max(1, int(0.4 * len(trips))), len(trips) - 1)
+        support.extend(trips[i] for i in order[:n_support])
+        pool.extend(trips[i] for i in order[n_support:])
+    if len(pool) < 40:
+        raise ValueError('Too few independent normal trajectories for meaningful 95% calibration')
+    assert not {key(t) for t in support} & {key(t) for t in pool}
+    def loader(trajs):
+        dataset = MobDefBenchDataset(
+            trajs, data_module.concept_definitions, {},
+            max_len=data_module.max_len, split='test',
+        )
+        return DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
+                          collate_fn=collate_mobdef, drop_last=False)
+    support_banks = fit_user_routines(model, loader(support), device)
+    assert all(t.user_id in support_banks for t in pool)
+    energies = collect_normal_energies(model, loader(pool), device, support_banks, def_bank)
+    np.save(output_dir / 'test_normal_energies.npy', energies)
+    torch.save(support_banks, output_dir / 'coverage_routine_banks.pt')
+    result = evaluate_independent_stage_a_coverage(
+        energies, args.coverage_repeats, args.coverage_calibration_fraction,
+        args.coverage_alpha, args.seed + 1000003,
+    )
+    def identifier(t):
+        return hashlib.sha256(json.dumps(key(t), ensure_ascii=True).encode()).hexdigest()
+    manifest = {
+        'support_ids': [identifier(t) for t in support],
+        'pool_ids_in_energy_order': [identifier(t) for t in pool],
+        'pool_user_ids': [str(t.user_id) for t in pool],
+        'excluded_ids': [identifier(t) for t in excluded],
+        'train_ids': [identifier(t) for t in data_module.trajectories['train']],
+        'model_selection_ids': [identifier(t) for t in data_module.trajectories['val']],
+    }
+    result.update({
+        'dataset': args.dataset, 'model_seed': args.seed,
+        'n_history_support': len(support), 'n_excluded_short_history': len(excluded),
+        'n_heldout_users': len(support_banks),
+        'history_support_fraction': 0.4,
+        'history_policy': 'fixed random normal support per held-out user, independent of all calibration/test samples',
+        'train_test_identity_overlap': 0, 'model_selection_test_identity_overlap': 0,
+        'history_test_identity_overlap': 0,
+        'wilson_interpretation': 'mean of within-split binomial Wilson endpoints; not a confidence interval for the repeated-split mean; clustered mobility dependence is not covered',
+        'args': vars(args),
+    })
+    save_results(manifest, str(output_dir / 'coverage_manifest.json'))
+    save_results(result, str(output_dir / 'independent_stage_a_coverage.json'))
+    logger.info('COVERAGE COMPLETE: coverage=%.6f +/- %.6f; support=%d cal=%d test=%d',
+                result['coverage']['mean'], result['coverage']['std'], len(support),
+                result['n_calibration_per_split'], result['n_test_per_split'])
+    return result
+
+
+def evaluate_independent_stage_a_coverage(
+    normal_energies: np.ndarray,
+    repeats: int,
+    calibration_fraction: float,
+    alpha: float,
+    seed: int,
+) -> Dict[str, Any]:
+    """Repeated split-conformal validation on an untouched normal test pool.
+
+    In every repetition, calibration and evaluation indices are disjoint.
+    The threshold is estimated only from the calibration indices and coverage
+    is computed only on their complement.  Wilson bounds are computed within
+    each split; the summary reports the mean split-wise bounds together with
+    the mean and standard deviation of the repeated-split point estimates.
+    """
+    energies = np.asarray(normal_energies, dtype=np.float64).reshape(-1)
+    n_total = int(energies.size)
+    if n_total < 2 or not np.isfinite(energies).all():
+        raise ValueError("At least two finite normal energies are required; nonfinite scores must not be imputed.")
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must lie strictly between 0 and 1")
+    if repeats < 1:
+        raise ValueError("repeats must be at least 1")
+    if not 0.0 < calibration_fraction < 1.0:
+        raise ValueError("calibration_fraction must lie strictly between 0 and 1")
+    n_cal = int(np.floor(n_total * calibration_fraction))
+    n_cal = min(max(n_cal, 1), n_total - 1)
+    n_test = n_total - n_cal
+
+    split_records: List[Dict[str, Any]] = []
+    target_coverage = 1.0 - alpha
+    for repeat in range(repeats):
+        rng = np.random.default_rng(seed + 10_007 * repeat)
+        indices = rng.permutation(n_total)
+        calibration_indices = indices[:n_cal]
+        test_indices = indices[n_cal:]
+        assert np.intersect1d(calibration_indices, test_indices).size == 0
+
+        calibrator = ConformalCalibrator()
+        q_norm = calibrator.fit_normality(energies[calibration_indices], alpha=alpha)
+        covered = energies[test_indices] <= q_norm
+        successes = int(covered.sum())
+        coverage = float(covered.mean())
+        ci_low, ci_high = _wilson_interval(successes, n_test)
+        split_records.append({
+            "repeat": repeat,
+            "split_seed": seed + 10_007 * repeat,
+            "n_calibration": n_cal,
+            "n_test": n_test,
+            "q_norm": float(q_norm),
+            "coverage": coverage,
+            "normal_fpr": 1.0 - coverage,
+            "wilson_95_low": ci_low,
+            "wilson_95_high": ci_high,
+            "undercoverage_gap": max(0.0, target_coverage - coverage),
+            "calibration_indices": calibration_indices.tolist(),
+            "test_indices": test_indices.tolist(),
+            "n_covered": successes,
+        })
+
+    def _summary(field: str) -> Dict[str, float]:
+        values = np.asarray([row[field] for row in split_records], dtype=np.float64)
+        return {
+            "mean": float(values.mean()),
+            "std": float(values.std(ddof=1)) if values.size > 1 else 0.0,
+        }
+
+    return {
+        "protocol": "repeated disjoint calibration/test splits of the untouched normal test pool",
+        "alpha": float(alpha),
+        "target_coverage": float(target_coverage),
+        "repeats": int(repeats),
+        "calibration_fraction": float(calibration_fraction),
+        "n_normal_pool": n_total,
+        "n_calibration_per_split": n_cal,
+        "n_test_per_split": n_test,
+        "coverage": _summary("coverage"),
+        "normal_fpr": _summary("normal_fpr"),
+        "undercoverage_gap": _summary("undercoverage_gap"),
+        "wilson_95_low": _summary("wilson_95_low"),
+        "wilson_95_high": _summary("wilson_95_high"),
+        "q_norm": _summary("q_norm"),
+        "splits": split_records,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -465,10 +686,16 @@ def _batch_user_prototypes(
     device: torch.device,
 ) -> Dict[str, torch.Tensor]:
     """Build batched prototype tensors."""
+    if user_prototypes:
+        example = next(iter(user_prototypes.values()))
+        default_k = int(example["mu"].shape[0])
+        default_d = int(example["mu"].shape[1])
+    else:
+        default_k, default_d = 8, 256
     default_proto = {
-        "mu": torch.zeros(8, 256),
-        "sigma": torch.ones(8, 256),
-        "pi": torch.ones(8) / 8,
+        "mu": torch.zeros(default_k, default_d),
+        "sigma": torch.ones(default_k, default_d),
+        "pi": torch.ones(default_k) / default_k,
     }
     mus, sigmas, pis = [], [], []
     for uid in user_ids:
@@ -497,6 +724,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--pretrain_epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--max_len", type=int, default=64,
+                        help="Maximum number of episodes retained per trajectory")
     parser.add_argument("--lr_backbone", type=float, default=1e-4)
     parser.add_argument("--lr_heads", type=float, default=1e-4)
     parser.add_argument("--no_amp", action="store_true",
@@ -531,8 +760,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w_para", type=float, default=0.2, help="Paraphrase loss weight")
     parser.add_argument("--w_orth", type=float, default=0.05, help="Orthogonality loss weight")
     parser.add_argument("--w_repel", type=float, default=0.3, help="Repel loss weight")
+    parser.add_argument("--lambda_prim", type=float, default=0.5,
+                        help="Primitive-evidence weight in the inference concept score")
+    parser.add_argument("--n_prototypes", type=int, default=8,
+                        help="Number of per-user diagonal-GMM components")
+    parser.add_argument("--alpha_norm", type=float, default=0.05,
+                        help="Stage-A split-conformal significance level")
+    parser.add_argument("--alpha_concept", type=float, default=0.10,
+                        help="Seen-concept split-conformal significance level")
     parser.add_argument("--random_bank", action="store_true",
                         help="Ablation: replace concept bank with random fixed embeddings")
+    parser.add_argument("--coverage_repeats", type=int, default=0,
+                        help="Repeated independent Stage-A calibration/test splits (0 disables)")
+    parser.add_argument("--coverage_calibration_fraction", type=float, default=0.5,
+                        help="Fraction of untouched normal test samples used for q_norm per repeat")
+    parser.add_argument("--coverage_alpha", type=float, default=0.05,
+                        help="Stage-A conformal miscoverage level for independent validation")
+    parser.add_argument("--coverage_only", action="store_true",
+                        help="After checkpoint selection, run only the independent coverage supplement")
     return parser.parse_args()
 
 
@@ -591,6 +836,7 @@ def main() -> None:
             concept_definitions=concept_defs,
             user_histories=user_histories,
             batch_size=args.batch_size,
+            max_len=args.max_len,
         )
     elif args.use_porto_real:
         logger.info("Using real Porto taxi data: %s", args.porto_parquet)
@@ -627,9 +873,8 @@ def main() -> None:
                 # pickle is already trip-level (TAXI_ID, TRIP_ID, TIMESTAMP, POLYLINE)
                 # skip the groupby reconstruction step
                 pdf = df.copy()
-                pdf = (pdf.groupby('TAXI_ID', group_keys=False)
-                          .apply(lambda g: g.sample(min(len(g), max_trips), random_state=42))
-                          .reset_index(drop=True))
+                pdf = _pd.concat([g.sample(min(len(g), max_trips), random_state=42)
+                                  for _, g in pdf.groupby('TAXI_ID')], ignore_index=True)
                 logger.info("Porto (pickle): %d trips from %d taxis",
                             len(pdf), pdf['TAXI_ID'].nunique())
                 trajs = []
@@ -684,9 +929,8 @@ def main() -> None:
                 records.append({'TAXI_ID': str(taxi_id), 'TRIP_ID': str(trip_id),
                                  'TIMESTAMP': int(grp['timestamp'].iloc[0]), 'POLYLINE': pts})
             pdf = _pd.DataFrame(records)
-            pdf = (pdf.groupby('TAXI_ID', group_keys=False)
-                      .apply(lambda g: g.sample(min(len(g), max_trips), random_state=42))
-                      .reset_index(drop=True))
+            pdf = _pd.concat([g.sample(min(len(g), max_trips), random_state=42)
+                              for _, g in pdf.groupby('TAXI_ID')], ignore_index=True)
             logger.info("Porto: %d trips from %d taxis", len(pdf), pdf['TAXI_ID'].nunique())
 
             trajs = []
@@ -761,6 +1005,7 @@ def main() -> None:
             concept_definitions=concept_defs,
             user_histories=user_histories,
             batch_size=args.batch_size,
+            max_len=args.max_len,
         )
     elif args.use_foursquare:
         # ------------------------------------------------------------------ #
@@ -885,10 +1130,11 @@ def main() -> None:
             concept_definitions=concept_defs,
             user_histories=user_histories,
             batch_size=args.batch_size,
+            max_len=args.max_len,
         )
     else:
         data_module = MobDefBenchDataModule.load_dataset(
-            args.dataset, batch_size=args.batch_size
+            args.dataset, batch_size=args.batch_size, max_len=args.max_len
         )
 
     train_loader = data_module.train_dataloader()
@@ -897,6 +1143,9 @@ def main() -> None:
     # ---- Model ----
     config = LangTrajConfig(
         text_encoder_name=args.text_encoder,
+        lambda_prim=args.lambda_prim,
+        n_prototypes=args.n_prototypes,
+        max_len=args.max_len,
     )
     model = LangTrajOSR(config).to(device)
     logger.info("Model parameters: %d", sum(p.numel() for p in model.parameters()))
@@ -1046,6 +1295,18 @@ def main() -> None:
             logger.info("Early stopping at epoch %d", epoch + 1)
             break
 
+    if args.coverage_only:
+        if args.coverage_repeats < 1:
+            raise ValueError('--coverage_only requires positive --coverage_repeats')
+        checkpoint = torch.load(output_dir / 'best_model.pt', map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        coverage = run_coverage_supplement(model, data_module, device, def_bank, args, output_dir)
+        save_results({'dataset': args.dataset, 'seed': args.seed,
+                      'best_epoch': checkpoint['epoch'], 'best_val_auroc': best_auroc,
+                      'training_history': train_history, 'args': vars(args),
+                      'independent_stage_a_coverage': coverage}, str(output_dir / 'results.json'))
+        return
+
     # ---- Calibration ----
     logger.info("Calibrating conformal thresholds on validation set")
     calibrator = ConformalCalibrator()
@@ -1062,7 +1323,7 @@ def main() -> None:
 
             episodes = _tensor_to_episode_dict(ep_tensor)
             proto_batch = _batch_user_prototypes(user_ids, user_prototypes, device)
-            outputs = model(episodes, ~pad_mask, proto_batch, def_bank)
+            outputs = model(episodes, pad_mask, proto_batch, def_bank)
 
             normal_idx = labels == 0
             if normal_idx.any():
@@ -1072,18 +1333,22 @@ def main() -> None:
 
     if val_energies_normal:
         all_normal_e = torch.cat(val_energies_normal).numpy()
-        calibrator.fit_normality(all_normal_e)
+        calibrator.fit_normality(all_normal_e, alpha=args.alpha_norm)
 
     all_val_scores = torch.cat(val_scores_all).numpy()
     all_val_labels = torch.cat(val_labels_all).numpy()
-    calibrator.fit_concepts(all_val_scores, all_val_labels)
+    calibrator.fit_concepts(
+        all_val_scores,
+        all_val_labels,
+        alpha=args.alpha_concept,
+    )
 
     # Save calibrator
     calibrator.save(str(output_dir / "calibrator.json"))
 
     # ---- Final evaluation on test set ----
     logger.info("Final evaluation on test set")
-    checkpoint = torch.load(output_dir / "best_model.pt", map_location=device)
+    checkpoint = torch.load(output_dir / "best_model.pt", map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     # Bug #11 fix: re-fit user prototypes with the best trained model so that
     # the GMM clusters reflect the final embedding space, not Stage-2 embeddings.
@@ -1107,6 +1372,41 @@ def main() -> None:
         split_metrics[split_name] = split_m
         logger.info("  %s — AUROC: %.4f", split_name, split_m.get("auroc", 0))
 
+    # Independent Stage-A coverage validation.  The source pool is the normal
+    # portion of the untouched test split, which has not participated in
+    # routine-bank fitting, validation/early stopping, or threshold fitting.
+    independent_coverage = None
+    if args.coverage_repeats > 0:
+        logger.info(
+            "Independent Stage-A coverage: %d repeats, calibration fraction %.3f",
+            args.coverage_repeats,
+            args.coverage_calibration_fraction,
+        )
+        test_normal_energies = collect_normal_energies(
+            model, test_loader, device, user_prototypes, def_bank,
+        )
+        np.save(output_dir / "test_normal_energies.npy", test_normal_energies)
+        independent_coverage = evaluate_independent_stage_a_coverage(
+            test_normal_energies,
+            repeats=args.coverage_repeats,
+            calibration_fraction=args.coverage_calibration_fraction,
+            alpha=args.coverage_alpha,
+            seed=args.seed + 1_000_003,
+        )
+        save_results(
+            independent_coverage,
+            str(output_dir / "independent_stage_a_coverage.json"),
+        )
+        logger.info(
+            "Independent coverage %.4f +/- %.4f; FPR %.4f +/- %.4f; n_cal=%d n_test=%d",
+            independent_coverage["coverage"]["mean"],
+            independent_coverage["coverage"]["std"],
+            independent_coverage["normal_fpr"]["mean"],
+            independent_coverage["normal_fpr"]["std"],
+            independent_coverage["n_calibration_per_split"],
+            independent_coverage["n_test_per_split"],
+        )
+
     # ---- Save results ----
     results = {
         "dataset": args.dataset,
@@ -1116,6 +1416,7 @@ def main() -> None:
         "test_metrics": test_metrics,
         "split_metrics": split_metrics,
         "training_history": train_history,
+        "independent_stage_a_coverage": independent_coverage,
         "args": vars(args),
     }
     save_results(results, str(output_dir / "results.json"))

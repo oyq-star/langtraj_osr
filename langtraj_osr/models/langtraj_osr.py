@@ -211,7 +211,8 @@ class LangTrajOSR(nn.Module):
         episodes : dict[str, Tensor]
             Raw episode features (see :class:`EpisodeEncoder`).
         mask : Tensor | None
-            Padding mask ``(B, L)``, ``True`` = padded.
+            Valid-position mask ``(B, L)``, ``True`` = valid. The trajectory
+            encoder receives its complement as its padding mask.
         user_prototypes : dict
             Batched prototype parameters (``mu``, ``sigma``, ``pi``).
         definition_texts : list[str] | Tensor
